@@ -57,6 +57,7 @@ jobs:
             -H "Authorization: Token ${{ steps.dd-auth.outputs.token }}" \
             -F "scan_type=Semgrep JSON Report" \
             -F "file=@semgrep-results.json" \
+            -F "product_type_name=DevSecOps Trabalho Final" \
             -F "product_name=VAmPI" \
             -F "engagement_name=github-actions" \
             -F "auto_create_context=true" \
