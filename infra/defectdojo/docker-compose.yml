@@ -1,0 +1,119 @@
+# DefectDojo usando as imagens já publicadas no Docker Hub (sem build local), para subir
+# rápido dentro de um job de CI efêmero. Baseado no docker-compose.yml oficial do projeto
+# (github.com/DefectDojo/django-DefectDojo), removendo os blocos "build:" e o bind mount
+# opcional de extra_settings.
+#
+# Porta publicada em 9090 (não 8080) de propósito: evita conflitar com o Dependency-Track
+# (infra/dependency-track), caso as duas infras sejam subidas juntas localmente (uso opcional,
+# só para tirar print da UI).
+name: defectdojo
+
+services:
+  nginx:
+    image: "defectdojo/defectdojo-nginx:3.3.200-alpine"
+    depends_on:
+      uwsgi:
+        condition: service_started
+    environment:
+      DD_UWSGI_HOST: "uwsgi"
+      DD_UWSGI_PORT: "3031"
+    volumes:
+      - defectdojo_media:/usr/share/nginx/html/media
+    ports:
+      - "127.0.0.1:9090:8080"
+
+  uwsgi:
+    image: "defectdojo/defectdojo-django:3.3.200-alpine"
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+      valkey:
+        condition: service_started
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '30', '--', '/entrypoint-uwsgi.sh']
+    environment:
+      DD_DEBUG: "False"
+      DD_ALLOWED_HOSTS: "*"
+      DD_DATABASE_URL: "postgresql://defectdojo:defectdojo@postgres:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://valkey:6379/0"
+      DD_CACHE_URL: "redis://valkey:6379/1"
+      DD_SECRET_KEY: "hhZCp@D28z!n@NED*yB!ROMt+WzsY*iq"
+      DD_CREDENTIAL_AES_256_KEY: "&91a*agLqesc*0DJ+2*bAbsUZfR*4nLw"
+    volumes:
+      - "defectdojo_media:/app/media"
+
+  celerybeat:
+    image: "defectdojo/defectdojo-django:3.3.200-alpine"
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+      valkey:
+        condition: service_started
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '30', '--', '/entrypoint-celery-beat.sh']
+    environment:
+      DD_DATABASE_URL: "postgresql://defectdojo:defectdojo@postgres:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://valkey:6379/0"
+      DD_CACHE_URL: "redis://valkey:6379/1"
+      DD_SECRET_KEY: "hhZCp@D28z!n@NED*yB!ROMt+WzsY*iq"
+      DD_CREDENTIAL_AES_256_KEY: "&91a*agLqesc*0DJ+2*bAbsUZfR*4nLw"
+
+  celeryworker:
+    image: "defectdojo/defectdojo-django:3.3.200-alpine"
+    depends_on:
+      initializer:
+        condition: service_completed_successfully
+      postgres:
+        condition: service_started
+      valkey:
+        condition: service_started
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '-t', '30', '--', '/entrypoint-celery-worker.sh']
+    environment:
+      DD_DATABASE_URL: "postgresql://defectdojo:defectdojo@postgres:5432/defectdojo"
+      DD_CELERY_BROKER_URL: "redis://valkey:6379/0"
+      DD_CACHE_URL: "redis://valkey:6379/1"
+      DD_SECRET_KEY: "hhZCp@D28z!n@NED*yB!ROMt+WzsY*iq"
+      DD_CREDENTIAL_AES_256_KEY: "&91a*agLqesc*0DJ+2*bAbsUZfR*4nLw"
+    volumes:
+      - "defectdojo_media:/app/media"
+
+  initializer:
+    image: "defectdojo/defectdojo-django:3.3.200-alpine"
+    depends_on:
+      postgres:
+        condition: service_started
+    entrypoint: ['/wait-for-it.sh', 'postgres:5432', '--', '/entrypoint-initializer.sh']
+    environment:
+      DD_DATABASE_URL: "postgresql://defectdojo:defectdojo@postgres:5432/defectdojo"
+      DD_ADMIN_USER: "admin"
+      DD_ADMIN_MAIL: "admin@defectdojo.local"
+      DD_ADMIN_FIRST_NAME: "Admin"
+      DD_ADMIN_LAST_NAME: "User"
+      # Ambiente efêmero recriado a cada run — senha fixa só para a automação conseguir logar
+      # via API na mesma execução, sem segredo real envolvido.
+      DD_ADMIN_PASSWORD: "ci-automation-only"
+      DD_INITIALIZE: "true"
+      DD_SECRET_KEY: "hhZCp@D28z!n@NED*yB!ROMt+WzsY*iq"
+      DD_CREDENTIAL_AES_256_KEY: "&91a*agLqesc*0DJ+2*bAbsUZfR*4nLw"
+
+  postgres:
+    image: postgres:18-alpine
+    environment:
+      PGDATA: /var/lib/postgresql/data
+      POSTGRES_DB: defectdojo
+      POSTGRES_USER: defectdojo
+      POSTGRES_PASSWORD: defectdojo
+    volumes:
+      - defectdojo_postgres:/var/lib/postgresql/data
+
+  valkey:
+    image: valkey/valkey:9-alpine
+    volumes:
+      - defectdojo_redis:/data
+
+volumes:
+  defectdojo_postgres: {}
+  defectdojo_media: {}
+  defectdojo_redis: {}

@@ -1,0 +1,181 @@
+name: DevSecOps Pipeline
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [master]
+
+# Ambiente efêmero: DefectDojo e Dependency-Track sobem via docker compose dentro do próprio
+# job (infra/), recebem os achados, e são derrubados ao final. Nenhum segredo de longo prazo é
+# necessário para as credenciais de admin dessas ferramentas — só para a NVD_API_KEY, que acelera
+# o mirror inicial de vulnerabilidades do Dependency-Track.
+env:
+  DD_ADMIN_PASSWORD: ci-automation-only
+  DT_ADMIN_PASSWORD: ci-automation-only
+
+jobs:
+  sast-semgrep:
+    name: SAST (Semgrep -> DefectDojo)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Subir DefectDojo (efêmero)
+        run: docker compose -f infra/defectdojo/docker-compose.yml up -d
+
+      - name: Aguardar DefectDojo ficar pronto
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf -o /dev/null http://localhost:9090/login; then
+              echo "DefectDojo pronto"
+              exit 0
+            fi
+            echo "aguardando DefectDojo... ($i/60)"
+            sleep 10
+          done
+          echo "DefectDojo não ficou pronto a tempo" >&2
+          docker compose -f infra/defectdojo/docker-compose.yml logs
+          exit 1
+
+      - name: Rodar Semgrep
+        run: |
+          docker run --rm -v "${{ github.workspace }}:/src" returntocorp/semgrep:latest \
+            semgrep scan --config auto --json --output /src/semgrep-results.json /src
+
+      - name: Autenticar no DefectDojo
+        id: dd-auth
+        run: |
+          TOKEN=$(curl -sf -X POST http://localhost:9090/api/v2/api-token-auth/ \
+            -d "username=admin" -d "password=${DD_ADMIN_PASSWORD}" | jq -r .token)
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Importar achados do Semgrep no DefectDojo
+        id: dd-import
+        run: |
+          RESPONSE=$(curl -sf -X POST http://localhost:9090/api/v2/import-scan/ \
+            -H "Authorization: Token ${{ steps.dd-auth.outputs.token }}" \
+            -F "scan_type=Semgrep JSON Report" \
+            -F "file=@semgrep-results.json" \
+            -F "product_name=VAmPI" \
+            -F "engagement_name=github-actions" \
+            -F "auto_create_context=true" \
+            -F "minimum_severity=Info" \
+            -F "active=true" \
+            -F "verified=false")
+          echo "$RESPONSE" | tee dd-import-response.json
+          echo "test_id=$(echo "$RESPONSE" | jq -r .test)" >> "$GITHUB_OUTPUT"
+
+      - name: Listar achados importados (evidência)
+        run: |
+          curl -sf "http://localhost:9090/api/v2/findings/?test=${{ steps.dd-import.outputs.test_id }}&limit=200" \
+            -H "Authorization: Token ${{ steps.dd-auth.outputs.token }}" \
+            | jq '[.results[] | {title, severity, file_path, line}]' \
+            | tee dd-findings.json
+
+      - name: Publicar evidências
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sast-semgrep-evidencias
+          path: |
+            semgrep-results.json
+            dd-import-response.json
+            dd-findings.json
+
+      - name: Derrubar DefectDojo
+        if: always()
+        run: docker compose -f infra/defectdojo/docker-compose.yml down -v
+
+  sca-dependency-track:
+    name: SCA (cdxgen -> Dependency-Track)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Subir Dependency-Track (efêmero)
+        run: docker compose -f infra/dependency-track/docker-compose.yml up -d
+        env:
+          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
+
+      - name: Aguardar Dependency-Track ficar pronto
+        run: |
+          for i in $(seq 1 60); do
+            if curl -sf http://localhost:8080/api/version >/dev/null; then
+              echo "Dependency-Track pronto"
+              exit 0
+            fi
+            echo "aguardando Dependency-Track... ($i/60)"
+            sleep 10
+          done
+          echo "Dependency-Track não ficou pronto a tempo" >&2
+          docker compose -f infra/dependency-track/docker-compose.yml logs
+          exit 1
+
+      - name: Gerar SBOM com cdxgen
+        run: npx --yes @cyclonedx/cdxgen@latest -o bom.json -t python .
+
+      - name: Trocar senha inicial do Dependency-Track
+        run: |
+          curl -sf -X POST http://localhost:8080/api/v1/user/forceChangePassword \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=admin" \
+            --data-urlencode "newPassword=${DT_ADMIN_PASSWORD}" \
+            --data-urlencode "confirmPassword=${DT_ADMIN_PASSWORD}"
+
+      - name: Autenticar no Dependency-Track
+        id: dt-auth
+        run: |
+          TOKEN=$(curl -sf -X POST http://localhost:8080/api/v1/user/login \
+            --data-urlencode "username=admin" \
+            --data-urlencode "password=${DT_ADMIN_PASSWORD}")
+          echo "::add-mask::$TOKEN"
+          echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Enviar SBOM para o Dependency-Track
+        id: dt-upload
+        run: |
+          curl -sf -X POST http://localhost:8080/api/v1/bom \
+            -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" \
+            -F "autoCreate=true" \
+            -F "projectName=VAmPI" \
+            -F "projectVersion=github-actions" \
+            -F "bom=@bom.json;type=application/json" \
+            | tee dt-bom-response.json
+          echo "bom_token=$(jq -r .token dt-bom-response.json)" >> "$GITHUB_OUTPUT"
+
+      - name: Aguardar análise do SBOM
+        run: |
+          for i in $(seq 1 30); do
+            PROCESSING=$(curl -sf "http://localhost:8080/api/v1/bom/token/${{ steps.dt-upload.outputs.bom_token }}" \
+              -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" | jq -r .processing)
+            if [ "$PROCESSING" = "false" ]; then
+              echo "Análise concluída"
+              exit 0
+            fi
+            echo "processando SBOM... ($i/30)"
+            sleep 10
+          done
+
+      - name: Listar vulnerabilidades encontradas (evidência)
+        run: |
+          PROJECT_UUID=$(curl -sf "http://localhost:8080/api/v1/project/lookup?name=VAmPI&version=github-actions" \
+            -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" | jq -r .uuid)
+          curl -sf "http://localhost:8080/api/v1/finding/project/$PROJECT_UUID" \
+            -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" \
+            | jq '[.[] | {component: .component.name, version: .component.version, vulnerability: .vulnerability.vulnId, severity: .vulnerability.severity}]' \
+            | tee dt-findings.json
+
+      - name: Publicar evidências
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: sca-dependency-track-evidencias
+          path: |
+            bom.json
+            dt-bom-response.json
+            dt-findings.json
+
+      - name: Derrubar Dependency-Track
+        if: always()
+        run: docker compose -f infra/dependency-track/docker-compose.yml down -v
