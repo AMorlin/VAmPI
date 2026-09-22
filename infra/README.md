@@ -242,6 +242,19 @@ curl.exe -X POST http://localhost:8080/api/v1/bom `
   -F "bom=@bom.json;type=application/json"
 ```
 
+> **Se o seu caminho local tiver espaço** (ex.: repositório dentro do OneDrive, como
+> `...\14. Desenvolvimento de Software Seguro com DevSecOps\VAmPI`), o `npx cdxgen` pode falhar
+> tentando resolver as dependências Python — o `pip`, chamado por baixo dos panos, interpreta um
+> pedaço do caminho como se fosse um nome de pacote (erro tipo `Invalid requirement: 'DevOps\14.'`).
+> Rode o `cdxgen` dentro de um container em vez de via `npx` — daí o caminho vira só `/app` dentro
+> do Linux do container, sem espaço nenhum, e o bug some:
+>
+> ```powershell
+> docker run --rm -v "${PWD}:/app" ghcr.io/cyclonedx/cdxgen:master -o /app/bom.json -t python /app
+> ```
+>
+> (Bash: `docker run --rm -v "$PWD:/app" ghcr.io/cyclonedx/cdxgen:master -o /app/bom.json -t python /app`)
+
 Os achados aparecem em **http://localhost:8081** → Projects → VAmPI → local → Vulnerabilities, ou
 via API:
 
