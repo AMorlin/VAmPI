@@ -6,9 +6,10 @@ on:
     branches: [master]
 
 # Ambiente efêmero: DefectDojo e Dependency-Track sobem via docker compose dentro do próprio
-# job (infra/), recebem os achados, e são derrubados ao final. Nenhum segredo de longo prazo é
-# necessário para as credenciais de admin dessas ferramentas — só para a NVD_API_KEY, que acelera
-# o mirror inicial de vulnerabilidades do Dependency-Track.
+# job (infra/), recebem os achados, e são derrubados ao final. Nenhum segredo é necessário: o
+# Dependency-Track 5.x espelha NVD/GHSA/OSV automaticamente sem precisar de API key — só leva
+# alguns minutos após o primeiro boot pra ter uma base útil, por isso o job espera esse mirror
+# antes de consultar achados.
 env:
   DD_ADMIN_PASSWORD: ci-automation-only
   DT_ADMIN_PASSWORD: ci-automation-only
@@ -96,8 +97,6 @@ jobs:
 
       - name: Subir Dependency-Track (efêmero)
         run: docker compose -f infra/dependency-track/docker-compose.yml up -d
-        env:
-          NVD_API_KEY: ${{ secrets.NVD_API_KEY }}
 
       - name: Aguardar Dependency-Track ficar pronto
         run: |
@@ -112,9 +111,6 @@ jobs:
           echo "Dependency-Track não ficou pronto a tempo" >&2
           docker compose -f infra/dependency-track/docker-compose.yml logs
           exit 1
-
-      - name: Gerar SBOM com cdxgen
-        run: npx --yes @cyclonedx/cdxgen@latest -o bom.json -t python .
 
       - name: Trocar senha inicial do Dependency-Track
         run: |
@@ -132,6 +128,29 @@ jobs:
             --data-urlencode "password=${DT_ADMIN_PASSWORD}")
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
+
+      - name: Aguardar mirror de vulnerabilidades (NVD/GHSA/OSV)
+        run: |
+          # O Dependency-Track 5.x baixa NVD/GHSA/OSV automaticamente no primeiro boot, sem
+          # precisar de API key, mas o mirror inicial é grande. Medido empiricamente: uma CVE
+          # comum (CVE-2023-30861, afeta Flask) só aparece depois de ~150 mil registros
+          # espelhados, por volta de 6 minutos após o boot. Por isso o limiar aqui é alto, com
+          # folga — um limiar baixo (testado antes) deixava a análise rodar contra uma base
+          # ainda incompleta e devolvia zero achados mesmo em pacotes com CVE conhecida.
+          for i in $(seq 1 40); do
+            COUNT=$(curl -sf "http://localhost:8080/api/v1/vulnerability?limit=1" \
+              -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" \
+              -D - -o /dev/null | grep -i "^x-total-count:" | tr -dc '0-9')
+            echo "vulnerabilidades espelhadas até agora: ${COUNT:-0} ($i/40)"
+            if [ "${COUNT:-0}" -ge 160000 ]; then
+              echo "Base de vulnerabilidades pronta"
+              break
+            fi
+            sleep 20
+          done
+
+      - name: Gerar SBOM com cdxgen
+        run: npx --yes @cyclonedx/cdxgen@latest -o bom.json -t python .
 
       - name: Enviar SBOM para o Dependency-Track
         id: dt-upload
