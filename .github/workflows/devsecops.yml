@@ -129,23 +129,51 @@ jobs:
           echo "::add-mask::$TOKEN"
           echo "token=$TOKEN" >> "$GITHUB_OUTPUT"
 
-      - name: Aguardar mirror de vulnerabilidades (NVD/GHSA/OSV)
+      - name: Configurar fontes de vulnerabilidade (OSS Index + OSV)
         run: |
-          # O Dependency-Track 5.x baixa NVD/GHSA/OSV automaticamente no primeiro boot, sem
-          # precisar de API key, mas o mirror inicial é grande. Medido empiricamente: uma CVE
-          # comum (CVE-2023-30861, afeta Flask) só aparece depois de ~150 mil registros
-          # espelhados, por volta de 6 minutos após o boot. Por isso o limiar aqui é alto, com
-          # folga — um limiar baixo (testado antes) deixava a análise rodar contra uma base
-          # ainda incompleta e devolvia zero achados mesmo em pacotes com CVE conhecida.
-          for i in $(seq 1 40); do
-            COUNT=$(curl -sf "http://localhost:8080/api/v1/vulnerability?limit=1" \
-              -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" \
-              -D - -o /dev/null | grep -i "^x-total-count:" | tr -dc '0-9')
-            echo "vulnerabilidades espelhadas até agora: ${COUNT:-0} ($i/40)"
-            if [ "${COUNT:-0}" -ge 160000 ]; then
-              echo "Base de vulnerabilidades pronta"
+          # Desliga o mirror do NVD (só casa por CPE, e o cdxgen gera SBOM Python só com purl —
+          # nunca teria achado, só gastaria minutos baixando à toa). Liga o OSV pro ecossistema
+          # PyPI (mirror pequeno, casa por purl, sem precisar de credencial) e o OSS Index (casa
+          # por purl em tempo real via API, usando a conta configurada nos secrets do repo).
+          curl -sf -X POST http://localhost:8080/api/v1/configProperty/aggregate \
+            -H "Authorization: Bearer ${{ steps.dt-auth.outputs.token }}" \
+            -H "Content-Type: application/json" \
+            -d '[
+              {"groupName":"vuln-source","propertyName":"nvd.enabled","propertyValue":"false"},
+              {"groupName":"vuln-source","propertyName":"google.osv.enabled","propertyValue":"PyPI"},
+              {"groupName":"scanner","propertyName":"ossindex.enabled","propertyValue":"true"},
+              {"groupName":"scanner","propertyName":"ossindex.api.username","propertyValue":"'"${OSSINDEX_API_USERNAME}"'"},
+              {"groupName":"scanner","propertyName":"ossindex.api.token","propertyValue":"'"${OSSINDEX_API_TOKEN}"'"}
+            ]'
+        env:
+          OSSINDEX_API_USERNAME: ${{ secrets.OSSINDEX_API_USERNAME }}
+          OSSINDEX_API_TOKEN: ${{ secrets.OSSINDEX_API_TOKEN }}
+
+      - name: Reiniciar o Dependency-Track para aplicar a config
+        run: |
+          # Medido empiricamente: mudar via API não afeta o mirror já agendado no boot atual —
+          # só é lido nas tarefas seguintes. Reiniciar o apiserver força reler a config já
+          # persistida logo no início do próximo boot.
+          docker compose -f infra/dependency-track/docker-compose.yml restart apiserver
+          for i in $(seq 1 30); do
+            if curl -sf http://localhost:8080/api/version >/dev/null; then
+              echo "Dependency-Track voltou"
               break
             fi
+            sleep 5
+          done
+
+      - name: Aguardar mirror do OSV (PyPI)
+        run: |
+          # Bem menor que o NVD (só o ecossistema PyPI: ~25 mil advisories, ~4-5 minutos), mas
+          # ainda precisa terminar de baixar e indexar antes do SBOM ser analisado.
+          for i in $(seq 1 30); do
+            if docker compose -f infra/dependency-track/docker-compose.yml logs apiserver 2>&1 \
+                | grep -q "Google OSV mirroring complete"; then
+              echo "Mirror do OSV completo"
+              break
+            fi
+            echo "aguardando mirror do OSV... ($i/30)"
             sleep 20
           done
 
