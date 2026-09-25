@@ -95,3 +95,7 @@ venv.bak/
 .mypy_cache/
 
 .idea/
+
+# Saídas de scans rodados localmente (a pipeline gera e publica como artifacts)
+bom.json
+semgrep-results.json

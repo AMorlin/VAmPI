@@ -6,10 +6,12 @@ on:
     branches: [master]
 
 # Ambiente efêmero: DefectDojo e Dependency-Track sobem via docker compose dentro do próprio
-# job (infra/), recebem os achados, e são derrubados ao final. Nenhum segredo é necessário: o
-# Dependency-Track 5.x espelha NVD/GHSA/OSV automaticamente sem precisar de API key — só leva
-# alguns minutos após o primeiro boot pra ter uma base útil, por isso o job espera esse mirror
-# antes de consultar achados.
+# job (infra/), recebem os achados, e são derrubados ao final. As senhas abaixo só valem durante
+# o run. O Dependency-Track usa a linha clássica 4.14.4 com OSV (PyPI) + OSS Index, que casam por
+# purl — a 5.x só casa por CPE (NVD) e nunca achava nada no SBOM Python do cdxgen. O OSV não
+# precisa de credencial; o OSS Index usa os secrets OSSINDEX_API_USERNAME/OSSINDEX_API_TOKEN
+# (opcionais — sem eles, os achados vêm só do OSV). O job espera o mirror do OSV terminar antes de
+# enviar o SBOM.
 env:
   DD_ADMIN_PASSWORD: ci-automation-only
   DT_ADMIN_PASSWORD: ci-automation-only
